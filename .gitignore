@@ -1,0 +1,22 @@
+# Ignore Python virtual environment
+venv/
+
+# Ignore system files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore model checkpoints and logs
+*.h5
+*.keras
+*.hdf5
+*.log
+
+# Ignore compressed files
+*.tgz
+*.zip
+*.tar.gz
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
