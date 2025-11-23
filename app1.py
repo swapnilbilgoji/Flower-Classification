@@ -15,7 +15,7 @@ st.set_page_config(page_title="Fruit Ripeness Classifier", layout="wide")
 # ---------------------------
 # Config / model path
 # ---------------------------
-MODEL_PATH = "Fruit_Classification_MOdel.h5"   # <-- change if your model filename is different
+MODEL_PATH = "Fruit_Classification_Model.h5"   # <-- change if your model filename is different
 
 FRUITS = ["Apple", "Banana", "Mango", "Orange", "Tomato"]
 RIPENESS_CLASSES = ["unripe", "ripe", "overripe"]  # model's class order - ensure matches training
