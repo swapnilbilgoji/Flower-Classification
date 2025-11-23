@@ -13,6 +13,11 @@ import matplotlib.pyplot as plt
 # For Drive fallback
 import requests
 
+# Keras helpers for fallback model
+from tensorflow.keras.applications import InceptionV3
+from tensorflow.keras.layers import Input, GlobalAveragePooling2D, Dense, Dropout
+from tensorflow.keras.models import Model
+
 st.set_page_config(page_title="Fruit Ripeness Classifier", layout="wide")
 
 # ---------------------------
@@ -190,47 +195,84 @@ def plot_days_to_ripen(unripe_records, days_map):
     return fig
 
 # ---------------------------
-# Model loader with Drive fallback
+# Model loader with Drive fallback + weight-by-name fallback
 # ---------------------------
 @st.cache_resource
-def load_model_with_fallback(local_path):
-    # If exists locally, load normally
+def load_model_with_fallback(local_path, image_size=(224,224), num_classes=3):
+    """Load model; if full-model load fails due to graph mismatch,
+       build a single-input model and load weights by_name."""
+    # 1) If exists locally try load full model first (best case)
     if os.path.exists(local_path):
+        try:
+            model = tf.keras.models.load_model(local_path)
+            # infer input size if possible
+            try:
+                shape = model.input_shape
+                if shape and len(shape) >= 3:
+                    h = shape[1] if shape[1] is not None else image_size[0]
+                    w = shape[2] if shape[2] is not None else image_size[1]
+                else:
+                    h, w = image_size
+            except Exception:
+                h, w = image_size
+            st.sidebar.success("Loaded full model file successfully.")
+            return model, (int(h), int(w))
+        except Exception as e_full:
+            # keep exception for logging and fallback
+            st.sidebar.warning(f"Full model load failed: {str(e_full)}. Trying weight-by-name fallback...")
+
+    # 2) If not present locally, try to download (this may raise on failure)
+    if not os.path.exists(local_path):
+        try:
+            try_download_from_drive(local_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to download model from Google Drive: {e}")
+
+    # 3) After download, try full load again (in case download completed)
+    try:
         model = tf.keras.models.load_model(local_path)
-        # infer input size
         try:
             shape = model.input_shape
             if shape and len(shape) >= 3:
-                h = shape[1] if shape[1] is not None else 224
-                w = shape[2] if shape[2] is not None else 224
+                h = shape[1] if shape[1] is not None else image_size[0]
+                w = shape[2] if shape[2] is not None else image_size[1]
             else:
-                h, w = 224, 224
+                h, w = image_size
         except Exception:
-            h, w = 224, 224
+            h, w = image_size
+        st.sidebar.success("Loaded full model file successfully after download.")
         return model, (int(h), int(w))
+    except Exception as e_full2:
+        st.sidebar.warning(f"Full model load still failed: {str(e_full2)}. Attempting to build compatible model and load weights by name...")
 
-    # Not found locally -> try download from Google Drive
-    # Show a message to user (outside of cached fn Streamlit will still show UI updates)
+    # 4) Build a single-input Functional model matching your training architecture
     try:
-        try_download_from_drive(local_path)
-    except Exception as e:
-        # bubble up to outer try/except in main code
-        raise RuntimeError(f"Failed to download model from Google Drive: {e}")
+        inputs = Input(shape=(image_size[0], image_size[1], 3), name="input_image")
+        # create backbone; pass `inputs` so base model is single-input
+        base = InceptionV3(weights='imagenet', include_top=False, input_tensor=inputs)
 
-    # After download, ensure file exists & load
-    if not os.path.exists(local_path):
-        raise FileNotFoundError(f"Model not found at {local_path} even after attempted download.")
-    model = tf.keras.models.load_model(local_path)
-    try:
-        shape = model.input_shape
-        if shape and len(shape) >= 3:
-            h = shape[1] if shape[1] is not None else 224
-            w = shape[2] if shape[2] is not None else 224
-        else:
-            h, w = 224, 224
-    except Exception:
-        h, w = 224, 224
-    return model, (int(h), int(w))
+        x = base.output
+        x = GlobalAveragePooling2D(name="gap")(x)
+        x = Dense(256, activation='relu', name='new_dense_1')(x)
+        x = Dropout(0.2, name='dropout_1')(x)
+        x = Dense(128, activation='relu', name='new_dense_2')(x)
+        outputs = Dense(num_classes, activation='softmax', name='new_output')(x)
+
+        fallback_model = Model(inputs=inputs, outputs=outputs, name="fallback_inception_model")
+        # compile lightly (not strictly needed for inference)
+        fallback_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+                               loss=tf.keras.losses.CategoricalCrossentropy(),
+                               metrics=['accuracy'])
+
+        # 5) Load weights by name from the .h5. This will map layer weights by layer.name
+        fallback_model.load_weights(local_path, by_name=True)
+        st.sidebar.success("Loaded weights by name into a rebuilt single-input model.")
+        return fallback_model, (image_size[0], image_size[1])
+
+    except Exception as e_fallback:
+        # final failure: raise with helpful message
+        raise RuntimeError("Failed to load model (full load and weight-by-name fallback both failed). "
+                           f"Error detail: {e_fallback}")
 
 # ---------------------------
 # Session state init
