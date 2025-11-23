@@ -4,3 +4,4 @@ pillow
 streamlit
 pandas
 matplotlib
+opencv-python-headless
