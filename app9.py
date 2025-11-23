@@ -6,11 +6,8 @@ import numpy as np
 from PIL import Image
 import cv2
 import time
-import tempfile
 from io import BytesIO
 import matplotlib.pyplot as plt
-
-# For Drive fallback
 import requests
 
 # Keras helpers for fallback model
@@ -24,9 +21,6 @@ st.set_page_config(page_title="Fruit Ripeness Classifier", layout="wide")
 # Config / model path
 # ---------------------------
 MODEL_PATH = "Fruit_Classification_Model.h5"   # local filename to use
-# Optionally set GOOGLE DRIVE file id or shareable link in streamlit secrets or env vars:
-#  - st.secrets["GDRIVE_FILE_ID"] or os.environ["GDRIVE_FILE_ID"]
-#  - or st.secrets["GDRIVE_SHAREABLE_LINK"] or os.environ["GDRIVE_SHAREABLE_LINK"]
 
 FRUITS = ["Apple", "Banana", "Mango", "Orange", "Tomato"]
 RIPENESS_CLASSES = ["unripe", "ripe", "overripe"]
@@ -43,10 +37,6 @@ DEFAULT_DAYS_TO_RIPE = {
 # Google Drive download helpers
 # ---------------------------
 def _get_gdrive_file_id_from_link(link: str):
-    # extract file id from common drive link formats
-    # examples:
-    # - https://drive.google.com/file/d/<fileid>/view?usp=sharing
-    # - https://drive.google.com/open?id=<fileid>
     if "/file/d/" in link:
         parts = link.split("/file/d/")[1].split("/")
         return parts[0]
@@ -56,29 +46,20 @@ def _get_gdrive_file_id_from_link(link: str):
     return None
 
 def download_from_google_drive_requests(file_id: str, destination: str, progress_placeholder=None):
-    """
-    Download a file from Google Drive handling the large-file confirmation flow.
-    """
     URL = "https://docs.google.com/uc?export=download"
     session = requests.Session()
-
     response = session.get(URL, params={"id": file_id}, stream=True)
     token = None
-
-    # search confirm token in cookies or in content (for large files)
     for key, value in session.cookies.items():
         if key.startswith("download_warning"):
             token = value
             break
-
     if token:
         response = session.get(URL, params={"id": file_id, "confirm": token}, stream=True)
-
     CHUNK_SIZE = 32768
     total = response.headers.get('content-length')
     if total is not None:
         total = int(total)
-
     with open(destination, "wb") as f:
         downloaded = 0
         if total and progress_placeholder:
@@ -93,15 +74,8 @@ def download_from_google_drive_requests(file_id: str, destination: str, progress
         progress_placeholder.empty()
 
 def try_download_from_drive(destination: str):
-    """
-    Try to download model to `destination` using either gdown (if installed) or requests fallback.
-    Uses streamlit.secrets or environment variables for file id/link.
-    """
-    # First check secrets
     file_id = None
     share_link = None
-
-    # Try streamlit secrets
     try:
         secrets = st.secrets
         file_id = secrets.get("GDRIVE_FILE_ID") if secrets and "GDRIVE_FILE_ID" in secrets else None
@@ -109,34 +83,24 @@ def try_download_from_drive(destination: str):
     except Exception:
         file_id = None
         share_link = None
-
-    # Fallback to env vars
     if not file_id:
         file_id = os.environ.get("GDRIVE_FILE_ID")
     if not share_link:
         share_link = os.environ.get("GDRIVE_SHAREABLE_LINK")
-
     if share_link and not file_id:
         parsed = _get_gdrive_file_id_from_link(share_link)
         if parsed:
             file_id = parsed
-
     if not file_id:
         raise ValueError("Google Drive file id not provided. Set st.secrets['GDRIVE_FILE_ID'] or st.secrets['GDRIVE_SHAREABLE_LINK'] (or corresponding env vars).")
-
-    # Try gdown if available (handles large files smoothly)
     try:
         import gdown
-        # gdown accepts the id in the form "https://drive.google.com/uc?id=FILEID"
         url = f"https://drive.google.com/uc?id={file_id}"
-        # show progress placeholder
         progress = st.empty()
         progress.info("Downloading model from Google Drive via gdown (this may take a while)...")
-        # gdown.download(url, destination, quiet=False) returns destination path; show progress via gdown itself
         gdown.download(url, destination, quiet=False)
         progress.empty()
     except Exception:
-        # fallback to requests implementation
         progress = st.empty()
         progress.info("Downloading model from Google Drive (requests fallback; this may take a while)...")
         download_from_google_drive_requests(file_id, destination, progress_placeholder=progress)
@@ -195,17 +159,26 @@ def plot_days_to_ripen(unripe_records, days_map):
     return fig
 
 # ---------------------------
-# Model loader with Drive fallback + weight-by-name fallback
+# Quiet Model loader with Drive fallback + weight-by-name fallback
 # ---------------------------
 @st.cache_resource
-def load_model_with_fallback(local_path, image_size=(224,224), num_classes=3):
-    """Load model; if full-model load fails due to graph mismatch,
-       build a single-input model and load weights by_name."""
-    # 1) If exists locally try load full model first (best case)
+def load_model_with_fallback(local_path, image_size=(224,224), num_classes=3, debug=False):
+    """
+    Quiet loader:
+      - tries full model load
+      - downloads from Drive if missing
+      - retries full load
+      - if still fails, builds single-input InceptionV3 fallback and loads weights by_name
+    debug=True will write short info messages to sidebar.
+    """
+    def _sidebar(msg):
+        if debug:
+            st.sidebar.info(msg)
+
+    # 1) try full load if exists locally
     if os.path.exists(local_path):
         try:
             model = tf.keras.models.load_model(local_path)
-            # infer input size if possible
             try:
                 shape = model.input_shape
                 if shape and len(shape) >= 3:
@@ -215,20 +188,19 @@ def load_model_with_fallback(local_path, image_size=(224,224), num_classes=3):
                     h, w = image_size
             except Exception:
                 h, w = image_size
-            st.sidebar.success("Loaded full model file successfully.")
+            _sidebar("Loaded full model file successfully (local).")
             return model, (int(h), int(w))
-        except Exception as e_full:
-            # keep exception for logging and fallback
-            st.sidebar.warning(f"Full model load failed: {str(e_full)}. Trying weight-by-name fallback...")
+        except Exception:
+            _sidebar("Full model load failed (local).")
 
-    # 2) If not present locally, try to download (this may raise on failure)
+    # 2) if missing, download from Drive
     if not os.path.exists(local_path):
         try:
             try_download_from_drive(local_path)
         except Exception as e:
             raise RuntimeError(f"Failed to download model from Google Drive: {e}")
 
-    # 3) After download, try full load again (in case download completed)
+    # 3) try full load again after download
     try:
         model = tf.keras.models.load_model(local_path)
         try:
@@ -240,15 +212,14 @@ def load_model_with_fallback(local_path, image_size=(224,224), num_classes=3):
                 h, w = image_size
         except Exception:
             h, w = image_size
-        st.sidebar.success("Loaded full model file successfully after download.")
+        _sidebar("Loaded full model file successfully (after download).")
         return model, (int(h), int(w))
-    except Exception as e_full2:
-        st.sidebar.warning(f"Full model load still failed: {str(e_full2)}. Attempting to build compatible model and load weights by name...")
+    except Exception:
+        _sidebar("Full model load still failed (after download).")
 
-    # 4) Build a single-input Functional model matching your training architecture
+    # 4) fallback: build single-input model and load weights by name
     try:
         inputs = Input(shape=(image_size[0], image_size[1], 3), name="input_image")
-        # create backbone; pass `inputs` so base model is single-input
         base = InceptionV3(weights='imagenet', include_top=False, input_tensor=inputs)
 
         x = base.output
@@ -259,18 +230,15 @@ def load_model_with_fallback(local_path, image_size=(224,224), num_classes=3):
         outputs = Dense(num_classes, activation='softmax', name='new_output')(x)
 
         fallback_model = Model(inputs=inputs, outputs=outputs, name="fallback_inception_model")
-        # compile lightly (not strictly needed for inference)
         fallback_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
                                loss=tf.keras.losses.CategoricalCrossentropy(),
                                metrics=['accuracy'])
 
-        # 5) Load weights by name from the .h5. This will map layer weights by layer.name
         fallback_model.load_weights(local_path, by_name=True)
-        st.sidebar.success("Loaded weights by name into a rebuilt single-input model.")
+        _sidebar("Loaded weights by name into fallback model.")
         return fallback_model, (image_size[0], image_size[1])
 
     except Exception as e_fallback:
-        # final failure: raise with helpful message
         raise RuntimeError("Failed to load model (full load and weight-by-name fallback both failed). "
                            f"Error detail: {e_fallback}")
 
@@ -284,10 +252,10 @@ if "history" not in st.session_state:
 # Load model (main)
 # ---------------------------
 try:
-    model, TARGET_SIZE = load_model_with_fallback(MODEL_PATH)
-    st.sidebar.success(f"Loaded model: {os.path.basename(MODEL_PATH)} (input size {TARGET_SIZE[0]}x{TARGET_SIZE[1]})")
+    model, TARGET_SIZE = load_model_with_fallback(MODEL_PATH, debug=False)  # quiet by default
+    # optional single success message (uncomment if you want a short confirmation)
+    # st.sidebar.success(f"Model loaded ({TARGET_SIZE[0]}x{TARGET_SIZE[1]})")
 except Exception as e:
-    # show helpful instruction when download fails
     st.sidebar.error(f"Failed to load model at '{MODEL_PATH}': {e}")
     st.sidebar.markdown(
         """
